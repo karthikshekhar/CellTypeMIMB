@@ -26,11 +26,11 @@ NB.var.genes <- function(
   require(MASS)
   print("Identifying variable genes based on UMI Counts. Warning - use this only for UMI based data")
   
-  genes.use=set.ifnull(genes.use, rownames(object@data))
+  genes.use=Seurat:::SetIfNull(genes.use, rownames(object@data))
   object@hvg.info = data.frame()
   if (!do.idents | is.null(do.idents)){
     ident.label = "all"
-    cells.use=set.ifnull(cells.use,colnames(object@data))  
+    cells.use=Seurat:::SetIfNull(cells.use,colnames(object@data))  
     multi.idents = FALSE
   } else {
     if (is.logical(do.idents) & do.idents == T){
@@ -167,9 +167,6 @@ NB.var.genes <- function(
   
 }
 
-set.ifnull = function(a,b){
-  if (is.null(a)) return(b)
-}
 
 topGOterms = function( fg.genes = NULL,
                        bg.genes = NULL,
@@ -292,7 +289,6 @@ plotConfusionMatrix = function(X,row.scale=TRUE, col.scale=FALSE, col.low="blue"
   }
   
   
-  #print(sum(is.na(X$Known)))
   
   
   p = ggplot(X, aes(y = Known,  x = Predicted)) + geom_point(aes(colour = Percentage,  size =Percentage)) + 
@@ -306,4 +302,82 @@ plotConfusionMatrix = function(X,row.scale=TRUE, col.scale=FALSE, col.low="blue"
   print(p)
   
   if (plot.return) return(p)
+}
+
+
+plot_sample_dist = function(object, id.use = "orig.ident",max.val.perc=100,
+                                        max.size=10,row.scale=FALSE,top.mar=1, left.mar = 4.5,
+                                        right.mar=1.5, bottom.mar = -1,do.transpose=FALSE,
+                                        ident.order=NULL,x.lab.rot=0,to.return=TRUE,alpha.use=1) {
+      
+              if (is.null(ident.order)){
+                ident.order = levels(object@ident)
+              }
+            
+            
+            # Get sample distribution
+            ExpMat = table(object@meta.data[,id.use],object@ident)
+            ExpMat = ExpMat[,ident.order]
+            if(row.scale){
+              ExpMat = t(scale(t(ExpMat), center=FALSE, scale=rowSums(ExpMat)))*100
+            } else {
+              ExpMat = scale(ExpMat, center=FALSE, scale=colSums(ExpMat))*100
+            }
+            ExpVal = melt(ExpMat)
+            colnames(ExpVal) = c("sample","cluster","perc")
+            ExpVal$sample = factor(ExpVal$sample, levels=rev(levels(object@meta.data[,id.use])))
+            ExpVal$cluster = factor(ExpVal$cluster, levels= ident.order)
+            p=ggplot(ExpVal, aes(y = factor(sample),  x = factor(cluster))) + geom_point(aes(colour = perc,  size =perc),alpha=alpha.use) + 
+              scale_color_gradient(low ="white",   high = "darkblue", limits=c(min(ExpVal$perc), max(ExpVal$perc) ))+scale_size(range = c(1, max.size))+   theme_bw() +nogrid
+            p = p + xlab("Cluster") + ylab("Sample") + theme(axis.text.x=element_text(size=12, face="italic", hjust=1)) + 
+              theme(axis.text.y=element_text(size=12, face="italic")) + theme(axis.text.x = element_text(angle = x.lab.rot))
+            
+              if (do.transpose){
+                ExpVal$sample = factor(ExpVal$sample, levels=levels(object@meta.data[,id.use]))
+                p=ggplot(ExpVal, aes(y = factor(cluster),  x = factor(sample))) + geom_point(aes(colour = perc,  size =perc), alpha=alpha.use) +
+                  scale_color_gradient(low ="white",   high = "darkblue", limits=c(min(ExpVal$perc), max(ExpVal$perc) )) + 
+                  scale_size(range = c(1, max.size))+   theme_bw() +nogrid
+                p = p + xlab("Sample") + ylab("Cluster") + theme(axis.text.x=element_text(size=12, face="italic", hjust=1)) + 
+                  theme(axis.text.x=element_text(size=12, face="italic", angle=45, hjust=1))
+              }
+              
+              print(p)
+            
+            if (to.return){
+              return(p)
+            }
+            
+}
+
+nogrid=theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+sort.column=function(x, col) {
+  return(x[order(x[,col]),])
+}
+
+
+RF_train = function(train_object0, var.genes, do.scale=FALSE){
+  
+  predictor_Data = as.matrix(train_object0@data[var.genes,])
+  if (do.scale) predictor_Data = t(scale(t(predictor_Data)))
+  max.cells.per.ident = 700; train.frac = 0.6
+  training.set = c(); validation.set=c()
+  training.label = c(); validation.label=c();
+  print(paste0("Using mininum of ", 0.5*100, " percent cells or ", max.cells.per.ident, " cells per cluster for training"))
+  for (i in as.character(levels(train_object0@ident))){
+    cells.in.clust = WhichCells(train_object0,i);
+    n = min(max.cells.per.ident, round(length(cells.in.clust)*train.frac))
+    train.temp = cells.in.clust[sample(length(cells.in.clust))][1:n]
+    validation.temp = setdiff(cells.in.clust, train.temp)
+    training.set = c(training.set,train.temp); validation.set=c(validation.set,validation.temp)
+    training.label = c(training.label, rep(as.numeric(i)-1,length(train.temp))); validation.label = c(validation.label, rep(as.numeric(i)-1, length(validation.temp)));
+  }
+  
+  print(length(training.set))
+  tmp = as.vector(table(training.label))
+  sampsizes = rep(min(tmp),length(tmp))
+  rf = randomForest(x=t(predictor_Data[,training.set]), y=factor(training.label), importance = TRUE, ntree = 301, proximity=TRUE, sampsize=sampsizes, keep.inbag=TRUE, replace=FALSE) 
+  validation_pred_rf = predict(rf,t(predictor_Data[,validation.set]))
+  #plotConfusionMatrix(table(validation.label, validation_pred_rf))
+  
+  return(rf)
 }
