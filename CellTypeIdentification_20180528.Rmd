@@ -1,0 +1,475 @@
+---
+title: "R Tutorial on Cell Type Identification from scRNA-seq Data"
+author: "Karthik Shekhar and Vilas Menon"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+```
+
+## Introduction
+
+In the following tutorial, we describe the basic computational steps for identifying molecularly distinct cell types from single-nucleus (sn) RNA-seq data. We will briefly touch upon some of the conceptual issues described in the text. However, we do not cover any of the steps relating to the preprocessing, alignment and quantification of sequencing reads; this was briefly described in the text, and is the topic of many reviews (e.g. Pertea et al., *Nature Protocols*, 2016 or Villani and Shekhar, *T-Cell Differentiation*, 2017). Our tutorial begins with the gene expression matrix, and delineates steps that follow in order to identify molecularly distinct cell types.   
+
+We use the R programming language (https://www.r-project.org), which is a versatile platform for many kinds of genomic analyses, and benefits from the availability of a wide array of statistical and bioinformatic libraries. Over the years, a number of software packages have been developed for single-cell transcritpomic analysis (https://github.com/seandavi/awesome-single-cell), and many of them are available through Bioconductor (https://www.bioconductor.org/), an open-source archive of bioinformatic R libraries with an active user community. This tutorial predominantly uses the Seurat package (Satija et al., *Nature Biotechnology*, 2015), an actively maintained set of tools for scRNA-seq analysis (https://satijalab.org/seurat/).
+
+Here we analyze snRNA-seq data covering human frontal cortex (FC), visual cortex (VC) and cerebellum (CB) (Lake et al., *Nature Biotechnology*, 2018). While the main text mostly refers to single "cells", we note that all the concepts discussed are equally applicable to RNA-seq data collected from single nuclei (sn-RNAseq). While RNA-seq data from nuclei does differ from cells in many key respects, such as an increased abundance of unspliced mRNA, there is ample evidence that they are highly correlated, and are equally representative of the cell's molecular identity. Moreover, scRNA-seq data snRNA-seq share similar statistical properties. Finally, although not discussed here, many of the tools applied here, ranging from dimensionality reduction to classification are also applicable to analyze other single-cell level measurements, such as epigenomic and protein (e.g. mass cytometry) data. It must, however, be stressed that these modalities contain key statistical differences that might warrant other approaches not applicable to sc- or sn-RNA-seq analysis.    
+
+```{r global_options, echo=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=80))
+```
+
+## Preprocessing : Read the count matrix and setup the Seurat object
+
+The following steps are implemented in RStudio, a free and open source integrated development environment (IDE) for R. First, we load necessary packages. `utilities.R` is a script that contains some custom functions written by the authors for this tutorial (https://github.com/karthikshekhar/CellTypeMIMB). 
+
+```{r, warning=FALSE, message=FALSE}
+library(Seurat)
+require(ggdendro)
+require(Rmisc)
+library(Matrix)
+library(MASS)
+library(xtable)
+library(Matrix.utils)
+library(DOSE)
+library(reshape2)
+library(topGO)
+library(randomForest)
+source("utilities.R")
+```
+
+We first read in the individual data matrices corresponding to the FC, VC and CB downloaded from the Gene Expression Omnibus submission of Lake et al., *Nature Biotechnology*, 2017 (NCBI Gene Expression Omnibus, GSE97942). These are stored in a locally accessible folder named `Data`. Since the majority of the entries of these expression matrices are "0", we immediately convert them to the sparse matrix format using the `Matrix` package to reduce the memory footprint.   
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+FrontCor_counts = read.table("Data/GSE97930_FrontalCortex_snDrop-seq_UMI_Count_Matrix_08-01-2017.txt.gz", header=TRUE)
+FrontCor_counts = Matrix(as.matrix(FrontCor_counts), sparse=TRUE)
+VisCor_counts = read.table("Data/GSE97930_VisualCortex_snDrop-seq_UMI_Count_Matrix_08-01-2017.txt.gz", header=TRUE)
+VisCor_counts = Matrix(as.matrix(VisCor_counts), sparse=TRUE)
+Cereb_counts = read.table("Data/GSE97930_CerebellarHem_snDrop-seq_UMI_Count_Matrix_08-01-2017.txt.gz", header=TRUE)
+Cereb_counts = Matrix(as.matrix(Cereb_counts), sparse=TRUE)
+```
+
+Next, we add a "tissue of origin" tag to the three tissue matrices and bind them into a single matrix. The rows of the final matrix correspond to the union of the genes in each of the three tissue matrices. Genes that are missing in any matrix are assumed to not be expressed. We use the `rBind.fill` function in the `Matrix.utils` package to fill in the missing genes,
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+colnames(FrontCor_counts) = paste0("FrontalCortex_",colnames(FrontCor_counts))
+colnames(VisCor_counts) = paste0("VisualCortex_",colnames(VisCor_counts))
+colnames(Cereb_counts) = paste0("Cerebellum_",colnames(Cereb_counts))
+Count.mat_sndrop = Matrix.utils::rBind.fill(t(VisCor_counts), t(FrontCor_counts), fill=0)
+Count.mat_sndrop = Matrix.utils::rBind.fill(Count.mat_sndrop, t(Cereb_counts), fill=0)
+Count.mat_sndrop = t(Count.mat_sndrop)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+# Cheating to avoid reading the big matrices everytime. This code section will not print and the two above will print, but not execute
+load("Lake_sndrop2018_counts.Rdata")
+load("LakeSeuratAnalysisObject.Rdata")
+snd <- SetAllIdent(snd, id="orig.ident")
+```
+
+Next, we initialize an S4 R object of the class `Seurat`. The various downstream computations will be performed on this object.
+
+```{r, cache.lazy=FALSE,message=FALSE, eval=FALSE}
+# Initialize the Seurat object with the raw (non-normalized data).  Keep all
+# genes expressed in >= 10 cells. Keep all cells with at
+# least 500 detected genes
+snd <- CreateSeuratObject(raw.data = Count.mat_sndrop, min.cells = 20, min.genes = 300, 
+                         project = "snDropBrain")
+```
+
+`snd@raw.data` is a slot in the Seurat object that stores the original gene expression matrix. We can visualize the first 10 rows (genes) and the first 10 columns (cells),
+
+```{r, cache.lazy=FALSE}
+snd@raw.data[1:10,1:10]
+```
+
+Let's check the dimensions of the normalized expression matrix and the number of cells from each sample. Here `snd@ident` stores the sample id's of the cells. 
+
+```{r, cache.lazy=FALSE}
+dim(snd@raw.data)
+table(snd@ident)
+```
+
+Thus, we have 23,413 genes and 34,234 cells, with 19,368 cells from the VC, 10,319 cells from the FC and 4,637 cells from the CB, respectively. We can visualize common metrics such as number of genes per cell (`nGene`) and number of transcripts/UMIs per cell (`nUMI`) as "violin plots" (a fancier version of the good old "box and whisker"" plots) using the Seurat plotting command `VlnPlot` 
+
+```{r, cache.lazy=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=120), fig.width= 12, fig.height=4}
+VlnPlot(object = snd, features.plot = c("nGene", "nUMI"), nCol = 2, point.size.use = 0.1)
+```
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig3.pdf",w=12,h=4, useDingbats = FALSE)
+VlnPlot(object = snd, features.plot = c("nGene", "nUMI"), nCol = 2, point.size.use = 0.1)
+dev.off()
+```
+
+## Analysis step 1 : Normalize the data
+
+Because of technical differences in cell-lysis and mRNA capture efficiency, the count vectors of two equivalent cells can differ in the total number of transcripts/UMIs across all genes. This makes it necessary to normalize the data first to attenuate these differences, which is carried out in two steps.
+
+1. We re-scale the counts in every cell to sum to a constant value - here, we choose the median of the total transcripts per cell as the scaling factor. This is often referred to as "library-size normalization".
+
+2. We apply a logarithmic transformation to the scaled expression values such that `E <- log(E+1)` (the addition of 1 is to ensure that zeros map to zero values). This transformation has two desirable properties,
+   + It shrinks values such that the data are more uniformly spread across its range of values, which is especially beneficial if there are outliers
+   + Since $log(A) - log(B) = log\left(\frac{A}{B}\right)$, it converts distances along a gene-axis to log-fold change values. This has the consequence that expression differerences across cells/samples are treated equally, irrespective of the absolute expression value of the gene. This might be especially desirable for lowly expressed genes such as transcription factors. 
+
+```{r, cache.lazy=FALSE, eval=FALSE}
+med_trans = median(Matrix::colSums(snd@raw.data[,snd@cell.names]))
+print(med_trans)
+snd <- NormalizeData(object = snd, normalization.method = "LogNormalize", 
+                    scale.factor = med_trans)
+```
+
+## Analysis step 2 : Detection of variable genes
+
+As described in the main text, it is common prior to dimensionality reduction (step 3) to choose features that are likely to be informative over features that represent statistical noise, a step known as "Feature Selection". In scRNA-seq data, this is accomplished by choosing genes that are "highly variable" under the assumption that variability in most genes does not represent meaningful biology. An additional challenge is the level of variability in a gene is related to its mean expression (a phenomenon known as heteroscedacity), which has to be explicitly accounted for. We perform variable gene selection using a recently-published  Poisson-Gamma mixture model (Pandey et al., 2018), which was demonstrated to accurately capture the statistical properties of UMI-based scRNA-seq data. We refer the reader to other variable gene selection methods - e.g. M3Drop (Andrews and Hemberg, 2016), mean-CV regression (Brennecke et al., 2013) or Seurat's in-build function `FindVariableGenes`.
+
+```{r, cache.lazy=FALSE, message=FALSE,tidy.opts=list(width.cutoff=120), fig.width= 4, fig.height=4}
+snd = NB.var.genes(snd, do.idents=FALSE, num.sd = 1.2)
+print(length(snd@var.genes))
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig4.pdf",w=5,h=5, useDingbats = FALSE)
+snd = NB.var.genes(snd, do.idents=FALSE, num.sd = 1.2)
+dev.off()
+```
+
+Thus, we find 1,307 variable genes in the data.
+
+## Analysis step 3: Z-scoring the data and removing unwanted sources of variation
+
+Variation in scRNA-seq data that is relevant to cell identity can be masked by many unwanted sources of variation. A common challenge is batch effects, which can be reflected in both transcriptomic differences and cell-type compositional differences between equivalent experimental batches. As mentioned earlier, variations in lysis efficiency, mRNA capture and amplification can result in substantial differences between the transcriptomes of equivalent cells. There can be additional sources of variation resulting from biological processes such as cell cycle, response to dissociation, stress and apoptosis that might dominate the measured transcriptomic state of the cell.    
+
+Correcting for such effects continues to be an active area of research, and many sophisticated approaches have been recently introduced (e.g. Butler et al., *Nature Biotechnology*, 2018), but a comprehensive overview is beyond our scope. Here, for demonstrative purposes, we remove variation in gene expression that is highly correlated with library size `nUMI`. Seurat performs a linear fit to the expression level of every gene using `nUMI` as a predictor, and returns the residuals as the "corrected" expression values. Next, the expression values are z-scored or standardized along every gene,
+
+$$
+E_{ij} \leftarrow \frac{E_{ij} - \bar E_{i}}{\sigma_i}
+$$
+Here $E_{ij}$ is the corrected gene expression value of gene $i$ in cell $j$, $\bar E_i$ and $\sigma_i$ are the mean and the standard deviation of gene $i$'s expression across all cells. The transformed expression values now have a zero mean and standard deviation equal to 1 across all genes. 
+
+Removing the effects of `nUMI` and z-scoring are performed together using Seurat's function `ScaleData`, which then stores the transformed gene expression values in the slot `snd@scale.data`.
+
+```{r, cache.lazy=FALSE, message=FALSE}
+snd <- ScaleData(object = snd, vars.to.regress = c("nUMI"), genes.use = snd@var.genes, display.progress = FALSE)
+```
+
+## Step 3: Perform linear dimensionality reduction using PCA  
+
+Although we have substantially reduced the number of relevant features in STEP 2 (from 23,413 to 2,353), we have not accounted for the fact that many of these genes are correlated with each other, and collectively define cell identity. This enables a further reduction of dimensionality in the data. Here, we accomplish this using Principal Component Analysis (PCA), a classical and extremely versatile dimensionality reduction method that identifies a linear subspace that most accurately captures the variance in the data (Hotelling, *Journal of Education Psychology*, 1933). Each of the individual axes of this subspace, known as principal vectors (PVs), are linear combinations of the original genes, and the projections of the original data onto these axes are known as principal components (or PCs.) 
+
+```{r, cache.lazy=FALSE}
+snd <- RunPCA(object = snd, do.print = TRUE, pcs.print = 1:2, 
+             genes.print = 5, pcs.compute = 50)
+```
+
+Each PV is defined by a set of weights corresponding to the genes (known as the "loadings"). A PV is said to be "driven" by genes with high weights (positive or negative), and two PVs represent independent, orthogonal directions.  The printed output of `RunPCA` lists the genes with the highest magnitude loadings (positive and negative) along the top PVs. 
+
+#$ Visualize the PCA results
+
+`Seurat` allows multiple ways to visualize the PC results, and these are useful to gain biological intuition. `VizPCA` shows the genes with the highest absolute loadings along any number of user specified PVs. 
+
+```{r, cache.lazy=FALSE,fig.width= 7, fig.height= 5}
+VizPCA(object = snd, pcs.use = 1:2)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig5.pdf",w=8,h=5, useDingbats = FALSE)
+VizPCA(object = snd, pcs.use = 1:2)
+dev.off()
+```
+
+`PCAPlot` allows plotting the cells in a reducted dimensional space of PCs, and can often highlight subpopulation structure. 
+
+```{r, cache.lazy=FALSE,fig.width= 6.5, fig.height= 3.5}
+PCAPlot(object = snd, dim.1 = 1, dim.2 = 2, pt.size=0.4)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig6.pdf",w=7,h=4, useDingbats = FALSE)
+PCAPlot(object = snd, dim.1 = 1, dim.2 = 2, pt.size=0.4)
+dev.off()
+```
+
+Here, by examining the results of both `VizPCA` and `PCAPlot`, we see that the cells with low values of PC1 are oligodendrocytes, characterized by the high loadings of characteristic genes such as Proteolipid Protein 1 (*PLP1*) and Myelin Basic Protein (*MBP*). On the other hand, genes with low values of PC2 are astrocytes, characterized by the expression of the transporters *SLC1A2* and *SLC1A3*. Next, `PCHeatmap` allows for easy visualization of the gene expression variation along each PC in the data, and can be particularly useful when trying to decide which PCs to include for further downstream analyses. Both cells and genes are ordered according to their PCA scores and loadings respectively along each PC. Setting cells.use to a number plots the "extreme" cells on both ends of the spectrum. 
+
+```{r, cache.lazy=FALSE, fig.width= 10, fig.height= 16}
+PCHeatmap(object = snd, pc.use = 1:12, cells.use = 500, do.balanced = TRUE, 
+          label.columns = FALSE, use.full = FALSE)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig7.pdf",w=10,h=16, useDingbats = FALSE)
+PCHeatmap(object = snd, pc.use = 1:12, cells.use = 500, do.balanced = TRUE, 
+          label.columns = FALSE, use.full = FALSE)
+dev.off()
+```
+
+While there are many formal methods to determine the number of statistically significant PCs (e.g. see Shekhar et al., *Cell*, 2016), a particularly easy and popular method is to examine the successive reduction in variance captured by increasing PCs, and identify an "elbow" where inclusion of PCs is of marginal utility (this is often called the "noise floor"). We do this using the Seurat function `PCElbowPlot`.
+
+```{r, cache.lazy=FALSE,fig.width= 4, fig.height= 2.5}
+PCElbowPlot(object = snd, num.pc = 50)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig8.pdf",w=6,h=4, useDingbats = FALSE)
+PCElbowPlot(object = snd, num.pc = 50)
+dev.off()
+```
+
+## Clustering
+
+We choose 25 PCs based on this plot. Thus, for every cell in the data, we have reduced its representation from ~23,000 genes to 25 PCs (a nearly 1000 fold reduction in dimensionality!). Next, we determine subpopulations in this data using Graph-based Clustering using the Seurat `FindClusters` function. Graph clustering has been widely used in recently scRNA-seq papers and has many desirable properties compared to other methods such as k-means clustering, hierarchical clustering and density-based clustering. Here, we first build a k-nearest neighbor graph on the data, connecting each cell to its k-nearest neighbor cells based on transcriptional similarity. The nearest neighbors are determined based on proximity in PC space using a euclidean distance metric. Next, similar to the strategy employed in Levine et al., *Cell* 2015 and Shekhar et al., *Cell*, 2016, the graph edge weights are refined based on the Jaccard-similarity metric, which removes spurious edges between clusters. `FindClusters` implements an algorithm that determines clusters that maximize a mathematical function known as the "modularity" on the Jaccard-weighted k-nearest neighbor graph. The function contains a `resolution` parameter that tunes the granularity of the clustering, with increased values leading to a greater number of clusters. We use a value of 1, but variations in this parameter need to be tested to check for robustness.  
+
+
+```{r, cache.lazy=FALSE}
+# save.SNN = T saves the SNN so that the clustering algorithm can be rerun
+# using the same graph but with a different resolution value (see docs for
+# full details)
+snd <- FindClusters(object = snd, reduction.type = "pca", dims.use = 1:25, 
+                   resolution = 1, print.output = 0, save.SNN = TRUE, force.recalc = TRUE)
+table(snd@ident)
+```
+
+Thus, we obtain 26 clusters in the data. We can visualize the clusters using t-distributed stochastic neighbor embedding (t-SNE, see van der Maaten and Hinton, *Journal of Machine Learning Research*, 2008), a 2-d embedding of the cells that preserves local distances. The cells are colored according to the cluster labels, 
+
+```{r, cache.lazy=FALSE,  fig.width= 6, fig.height= 4}
+snd <- RunTSNE(object = snd, dims.use = 1:25, do.fast = TRUE)
+TSNEPlot(object = snd, do.label = TRUE, pt.size = 0.4)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig9.pdf",w=8,h=6, useDingbats = FALSE)
+TSNEPlot(object = snd, do.label = TRUE, pt.size = 0.4)
+dev.off()
+```
+
+Next, we arrange the clusters on a dendrogram based on the similarity of their average transcriptomes using Seurat's `BuildClusterTree` function,
+
+```{r, cache.lazy=FALSE, message=FALSE}
+snd <- BuildClusterTree(snd, do.reorder = T, reorder.numeric = T, genes.use = snd@var.genes, show.progress = FALSE)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig10.pdf",w=9,h=6, useDingbats = FALSE)
+snd <- BuildClusterTree(snd, do.reorder = T, reorder.numeric = T, genes.use = snd@var.genes, show.progress = FALSE)
+dev.off()
+```
+
+As described in the manuscript, scRNA-seq clusters do not necessary correspond to cell types. While this often requires a mixture of prior knowledge and/or biological validation to assess, here we adopt a data driven criteria to assess cluster stability. Briefly, Seurat's `AssessNode` function, trains a classifier on each binary node of the dendrogram, and calculates the classification error for left/right clusters. We can use this information to collapse any node that exhibits > 15 % classification error. 
+
+```{r, cache.lazy=FALSE, message=FALSE}
+node.scores <- AssessNodes(snd)
+node.scores[order(node.scores$oobe,decreasing = T),] -> node.scores
+print(head(node.scores))
+```
+
+## Comparison of clusters with original labels
+
+Here, we see that the maximum "out of bag classification error" (oobe), is less than our threshold. Thus, we retain all 26 clusters. Next we compare our clustering result to the cluster labels published in Lake et al., 2018, which nominated 33 clusters in their analysis. While we have obviously fewer clusters, it would be interesting to examine how they compare to Lake et al.'s results. We first read in their cluster labels,    
+
+```{r, cache.lazy=FALSE}
+lake_clusters=unlist(lapply(strsplit(colnames(snd@data),"_"),function(x) x[2]))
+names(lake_clusters) = colnames(snd@data)
+length(table(lake_clusters))
+head(table(lake_clusters))
+```
+
+Here, `Ast` refers to astrocytes, `End` refers to endothelial cells, `Ex1` refers to Excitatory neuron group 1, and so on. To compare our cluster labels against Lake et al.'s, we plot a "confusion matrix", where each row corresponds to one of Lake et al's 33 clusters, while each column corresponds to our cluster. The matrix is row-normalized to depict how each cluster of Lake et al. distributes across our clusters. 
+
+```{r, cache.lazy=FALSE, fig.width= 9, fig.height= 8}
+A = table(lake_clusters, snd@ident)
+# we post-hoc specify the row order to make the matrix diagonal 
+row.order = c("Purk1","Purk2","Gran","In7","In8","In6a","In6b","In4b","In1c","In2","In3",
+              "In1a","In1b","In4a","OPC","Ex6b","Ex6a", "Ex8","Ex3a","Ex3b","Ex3c","Ex3d", "Ex3e", "Ex4","Ex5a","Ex5b",
+              "Ex1","Ex2","Mic","Per","End","Ast","Oli")
+a=plotConfusionMatrix(A[row.order,])
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig11.pdf",w=9,h=8, useDingbats = FALSE)
+a=plotConfusionMatrix(A[row.order,])
+dev.off()
+```
+
+Encouragingly, we see that although we have performed a completely unbiased analysis, many of our clusters exhibit a 1:1 correspondence with the clusters of Lake et al. For example, Cluster 21 (n=624) corresponds to Microglia (*Mic*), while Cluster 25 (n=4058 cells), corresponds to Oligodendrocytes (*Oli*). In cases where multiple Lake et al. clusters map to our clusters, these are related. For example, Purkinje cell clusters *Purk1* and *Purk2* map to Cluster 1 (n=977), while inhibitory neurons *In6a* and *In6b* map to Cluster 6 (n=1462). It's likely that a second round of iterative clustering might be necessary to resolve differences between closely related types such as *In6a* and *In6b*. While all this is encouraging, we also note some discrepancies - Clusters 2 (n=390), 24 (n=139) and 26 (n=30), do not really correspond to any of the Lake et al., clusters, while clusters 18 (n=2061) and 19 (n=2877), appear to non-specifically map to many Lake et al. clusters. 
+
+We can visualize the cluster composition of each of the three brain regions,
+
+```{r, cache.lazy=FALSE, fig.width= 8, fig.height= 3.5}
+# Each row is normalized to a 100%
+plot_sample_dist(snd, row.scale = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig12.pdf",w=10,h=4, useDingbats = FALSE)
+plot_sample_dist(snd, row.scale = TRUE)
+dev.off()
+```
+
+As can be seen Clusters 1-4 and 26, which include Purkinje neurons and Cerebellar granule cells, are exclusive to the CB sample, while majority of the remaining clusters are derived from the FC and VC samples. 
+
+## Differential Gene Expression
+
+Next, we find cluster-specific markers by performing a differential expression (DE) analysis between each cluster and the rest using Seurat's `FindMarkers` function. `FindMarkers` supports the use of multiple statistical approaches for DE (specified in the `test.use` parameter, see `Seurat` documentation). Here, we use the Student's t-test, as it is computationally efficient. However, we note that there are many limitations to using the t-test for single-cell RNA-seq data, particularly its inability to account for zero inflation. Readers must explore other methods such as `MAST` and `tweeDEseq` supported by `Seurat` (for a comprehensive review on DE methods, see Soneson and Robinson, *Nature Methods*, 2018). 
+
+```{r, cache.lazy=FALSE, warning=FALSE, message=FALSE}
+# find markers for every cluster compared to all remaining cells, report
+# only the positive ones
+snd.markers <- FindAllMarkers(object = snd, only.pos = TRUE, min.pct = 0.25, 
+                             thresh.use = 0.25, test.use = "t", max.cells.per.ident = 1000)
+head(snd.markers)
+```
+
+The output is a `data.frame` object summarizing the cluster-specific markers. Here, each row is a gene that is enriched in a cluster indicated in the column `cluster`. `pct.1` is the proportion of cells in the cluster that express this marker, while `pct.2` is the proportion of cells in the background that express this marker. We can examine markers for a given cluster as follows,
+
+```{r, cache.lazy=FALSE, warning=FALSE, message=FALSE}
+clust=25 # Oligodendrocytes
+head(subset(snd.markers,cluster==clust & pct.2 < 0.1))
+```
+
+As expected, the top two genes are *PLP1* (Proteolipid Protein 1) and *MOBP* (Myelin-Associated Oligodendrocyte Basic Protein), classical markers of Oligodendrocytes. Next, we examine cluster 12 (an excitatory neuronal cluster), which corresponds to *Ex6a*, and is marked by multiple genes including *HTR2C* and *NPSR1-AS1*
+
+```{r, cache.lazy=FALSE, fig.width= 7, fig.height= 10}
+head(subset(snd.markers,cluster==12 & pct.2 < 0.1))
+VlnPlot(snd,c("SLC17A7", "HTR2C","NPSR1-AS1"), nCol = 1, point.size.use = 0.01)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig13.pdf",w=9,h=8, useDingbats = FALSE)
+VlnPlot(snd,c("SLC17A7", "HTR2C","NPSR1-AS1"), nCol = 1, point.size.use = 0.01)
+dev.off()
+```
+
+Examining the identity of these clusters in detail is beyong the scope of this tutorial. Readers are encouraged dig deeper, and attempt to test variations in the methods outlined above. We end by demonstrating two common approaches to interpret results - (a) Examining gene-set enrichments, and (b) aligning clusters to alternative datasets 
+
+## Examining clusters for enrichment of biological processes
+
+After identifying markers, we can evaluate whether cluster-specific genes are enriched for any Gene Ontology (GO), Disease Ontology (DO), or Disease Gene Network (DGN) gene lists or categories. Each of these calls has multiple parameters, reflecting stringency of statistical overlap, but they are useful tools to evaluate clusters for functional or disease relevance.
+
+```{r, cache.lazy=FALSE}
+####evaluate for each cluster###
+require(org.Hs.eg.db)
+x=as.list(org.Hs.egALIAS2EG)
+geneList=rep(0,nrow(Count.mat_sndrop))
+names(geneList)=rownames(Count.mat_sndrop)
+geneList=geneList[intersect(names(geneList),names(x))]
+newallgenes=names(geneList)
+for (ii in 1:length(geneList)) {
+  names(geneList)[ii]=x[[names(geneList)[ii]]][1]
+}
+
+gene_enrichment_results=list()
+
+for (cl in as.character(unique(snd.markers$cluster))) {
+  print(paste0("Running cluster ",cl))
+testgenes=subset(snd.markers,cluster==cl)$gene
+gene_enrichment_results[[cl]]=list() 
+####Run against topGO####
+testgeneList=geneList
+testgeneList[which(newallgenes %in% testgenes)]=1
+genegene_enrichment_results=list()
+tab1=c()
+for (ont in c("BP","MF","CC")) {
+    sampleGOdata <- suppressMessages(new("topGOdata",description = "Simple session", ontology = ont,allGenes = as.factor(testgeneList),nodeSize = 10,annot=annFUN.org,mapping="org.Hs.eg.db",ID="entrez"))
+    resultTopGO.elim <- suppressMessages(runTest(sampleGOdata, algorithm = "elim", statistic = "Fisher"))
+    resultTopGO.classic <- suppressMessages(runTest(sampleGOdata, algorithm = "classic", statistic = "Fisher"))
+    ## look at results
+    tab1 <- rbind(tab1,GenTable( sampleGOdata, Fisher.elim = resultTopGO.elim, 
+                                 Fisher.classic = resultTopGO.classic,
+                                 orderBy = "Fisher.elim" , topNodes = 200))
+}
+gene_enrichment_results[[cl]][["topGO"]]=tab1
+
+####Run against DOSE###
+x <- suppressMessages(enrichDO(gene          = names(testgeneList)[testgeneList==1],
+                ont           = "DO",
+                pvalueCutoff  = 1,
+                pAdjustMethod = "BH",
+                universe      = names(testgeneList),
+                minGSSize     = 5,
+                maxGSSize     = 500,
+                qvalueCutoff  = 1,
+                readable      = T))
+gene_enrichment_results[[cl]][["DO"]]=x
+dgn <- suppressMessages(enrichDGN(names(testgeneList)[testgeneList==1]))
+gene_enrichment_results[[cl]][["DGN"]]=dgn
+}
+save(gene_enrichment_results,file="gene_enrichment_analysis.rda")
+```
+
+As an example, view the GO, DO, and DGN categories enriched for genes distinguishing cluster 1 (Purkinje Neurons). Note that the categories are arranged by adjusted p-value, and many are not significantly enriched.
+
+```{r, cache.lazy=FALSE}
+gene_enrichment_results[["1"]][["topGO"]][1:5,]
+gene_enrichment_results[["1"]][["DO"]][1:5,]
+gene_enrichment_results[["1"]][["DGN"]][1:5,]
+```
+
+## Comparison with Mouse Cortical Cell Types
+
+One of the many challenges in cell type classification studies is that of aligning clusters across different datasets, which might include different batches, different conditions (e.g. normal vs. disease), or even different species. Here we attempt to map clusters from a dataset of visual cortex (VC) neurons isolated and profiled from adult mouse using the Smart-seq method (Tasic et al., *Nature Neuroscience*, 2016) to our Human CB, VC and FC clusters in an unbiased manner. We use a multiclass classification approach described previously (Shekhar et al., *Cell*, 2016). 
+
+First, we read in the mouse VC data comprised of 1,679 cells and create a `Seurat` S4 object. To match the gene id's to Human data, we capitalize all gene names - note that a more exact, albeit lengthier approach would be to match genes based on an appropriate orthology database. We also read in the cluster assignments of each cell. Tasic et al. identified 49 transcriptomic types, comprising 23 inhibitory, 19 excitatory and 7 non-neuronal types. We next select features to train our classifier. We identify  variable genes using Seurat's `FindVariableGenes` function, which is more appropriate for Smart-seq data (see Pandey et al., *Current Biology*, 2018). After expanding the set of variable genes in the snRNA-seq data using `NB.var.genes`, we compute the common variable genes to train a multi-class classifer. 
+
+```{r, cache.lazy=FALSE}
+tasic_data = Matrix(as.matrix(read.csv("tasic_2016/genes_counts_2.csv", header = TRUE, row.names = 1)), sparse=TRUE)
+# Change gene name format to match to Human
+rownames(tasic_data) = toupper(rownames(tasic_data))
+mouse_vc <- CreateSeuratObject(raw.data = tasic_data, min.cells = 10, min.genes = 500, 
+                         project = "tasic")
+mouse.clusters = read.csv("tasic_2016/cluster_assignment_simple.csv", row.names = 2)
+mouse.labels = mouse.clusters$primary; names(mouse.labels) = rownames(mouse.clusters)
+mouse_vc@meta.data$type = mouse.labels[rownames(mouse_vc@meta.data)]
+mouse_vc = SetAllIdent(mouse_vc, id = "type")
+mouse_vc <- NormalizeData(object = mouse_vc, normalization.method = "LogNormalize", 
+                    scale.factor = 1e4)
+mouse_vc <- FindVariableGenes(object = mouse_vc, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, set.var.genes = TRUE)
+var.genes_snd = NB.var.genes(snd, do.idents=FALSE, num.sd = 0.8, do.plot = FALSE, set.var.genes = FALSE)
+var.genes = intersect(var.genes_snd, mouse_vc@var.genes)
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+pdf("Rmarkdown_Figs/Fig14.pdf",w=9,h=8, useDingbats = FALSE)
+mouse_vc <- FindVariableGenes(object = mouse_vc, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, set.var.genes = TRUE)
+
+dev.off()
+```
+
+Next, we train a Random Forest (RF) model (Breiman, 2001) on the snRNA-seq data  and use that to assign cluster labels to mouse VC data. Given a cell, the classifier maps it to one of 26 clusters. To account for scale differences between the snRNA-seq (3'-biased, UMI-based) and Smart-seq (full-length, non-UMI based), we standardize the two datasets (z-score values along each gene). After training it on the snRNA-seq data, we apply this classifier to each cell from the mouse VC data, and assign it to one of 26 snRNA-seq clusters.   
+
+```{r, cache.lazy=FALSE}
+rf_model = RF_train(snd,var.genes, do.scale=TRUE)
+pred.labels <- predict(rf_model, t(t(scale(t(mouse_vc@data[var.genes,])))))
+pred.labels <- factor(as.numeric(as.character(pred.labels)) + 1); names(pred.labels) = colnames(mouse_vc@data)
+```
+
+How do the cluster assignments compare with the cluster labels obtained from Tasic et al.? Note that the latter labels were not used in any way to either construct the classifier, or to influence the cluster assignment of cells. It would therefore be interesting to see if there is *any* correspondence between mouse cortical cell types, and their assigned "Human" type based on an unbiased classifier. We  examine the confusion matrix, as before, 
+
+```{r, cache.lazy=FALSE, fig.width= 9, fig.height= 8}
+a=plotConfusionMatrix(table(mouse.labels,pred.labels), order="Row")
+```
+
+The rows correspond to the Tasic et al. clusters, while each column corresponds to an snRNA-seq cluster. The matrix is row-normalized, such that each row adds up to a 100%. First, we see that Clusters 1-4 and 26, which are of Cerebellar origin, receive very few matches from mouse VC data, which largely map to Human clusters originating from VC and FC samples. Among non-neuronal cells, we see that mouse astrocytes and oligodendrocytes map to clusters 23 and 25, which are Human astrocytes and oligodendrocytes, respectively. Inhibitory neuronal groups expressing parvalbumin (*Pvalb*), Somatostatin (*Sst*) and Vasoactive intestinal peptide (*Vip*) map to clusters 6, 5 and 8 respectively. Examining the expression of these markers in the snRNA-seq data validates the RF cluster assignments. Thus, despite the fact that these two data sets differ in species (human vs mouse), cell fraction profiled (cytoplasmic vs. nucleus-only), profiling method (SMART-Seq vs. droplet-based sequencing), and clustering method (gene clustering vs. PCA-based methods vs. PCA-Louvain clustering), the overall results are comparable and interpretable, suggesting that the transcriptomic space these cells occupy is being appropriately parsed into subtypes.
+
+```{r, cache.lazy=FALSE, fig.width= 6, fig.height= 6.5}
+VlnPlot(snd,c("PVALB","SST","VIP"), nCol = 1, point.size.use = 0.01)
+```
+
+This concludes the tutorial. We can save files from the analysis as follows. 
+
+save(list=c("snd","snd.markers","rf_model","mouse_vc"), file="LakeSeuratAnalysisObject.Rdata")
+
+
+
+
+
+
+
+
+
+
